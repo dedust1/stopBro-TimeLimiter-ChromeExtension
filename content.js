@@ -275,6 +275,7 @@ function injectGoalStyles() {
       border: 1px solid rgba(0, 0, 0, 0.05);
       display: flex;
       flex-direction: column;
+      container-type: inline-size;
     }
     #stop-bro-goal-sticky .sbg-header {
       display: flex;
@@ -286,10 +287,18 @@ function injectGoalStyles() {
     }
     #stop-bro-goal-sticky.dragging .sbg-header { cursor: grabbing; }
     #stop-bro-goal-sticky .sbg-grip {
-      width: 20px;
-      height: 6px;
-      border-top: 2px dotted rgba(0, 0, 0, 0.35);
-      border-bottom: 2px dotted rgba(0, 0, 0, 0.35);
+      width: 22px;
+      height: 10px;
+      border: 2px solid rgba(0, 0, 0, 0.25);
+      border-radius: 3px;
+      background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.25) 0px,
+        rgba(0, 0, 0, 0.25) 2px,
+        transparent 2px,
+        transparent 4px
+      );
+      flex-shrink: 0;
     }
     #stop-bro-goal-sticky .sbg-timer {
       font-size: 13px;
@@ -301,7 +310,7 @@ function injectGoalStyles() {
       font-variant-numeric: tabular-nums;
     }
     #stop-bro-goal-sticky .sbg-goal {
-      font-size: 32px;
+      font-size: clamp(18px, 5cqw, 38px);
       line-height: 1.2;
       margin: 8px 0 10px;
       word-wrap: break-word;
