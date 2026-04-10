@@ -257,6 +257,12 @@ function injectGoalStyles() {
       top: 24px;
       right: 24px;
       width: 240px;
+      min-width: 180px;
+      min-height: 120px;
+      max-width: 500px;
+      max-height: 400px;
+      resize: both;
+      overflow: hidden;
       background: #FFF8B8;
       color: #333;
       padding: 14px 16px 12px;
@@ -267,13 +273,16 @@ function injectGoalStyles() {
       font-family: 'StopBroCaveat', 'Bradley Hand', 'Segoe Print', cursive;
       user-select: none;
       border: 1px solid rgba(0, 0, 0, 0.05);
+      display: flex;
+      flex-direction: column;
     }
     #stop-bro-goal-sticky .sbg-header {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       gap: 6px;
       cursor: grab;
-      margin-bottom: 4px;
+      margin-bottom: 2px;
     }
     #stop-bro-goal-sticky.dragging .sbg-header { cursor: grabbing; }
     #stop-bro-goal-sticky .sbg-grip {
@@ -282,27 +291,21 @@ function injectGoalStyles() {
       border-top: 2px dotted rgba(0, 0, 0, 0.35);
       border-bottom: 2px dotted rgba(0, 0, 0, 0.35);
     }
-    #stop-bro-goal-sticky .sbg-title {
-      flex: 1;
-      font-size: 11px;
+    #stop-bro-goal-sticky .sbg-timer {
+      font-size: 13px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       text-transform: uppercase;
       letter-spacing: 1px;
       color: rgba(0, 0, 0, 0.55);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
     }
     #stop-bro-goal-sticky .sbg-goal {
-      font-size: 26px;
-      line-height: 1.15;
-      margin: 2px 0 6px;
+      font-size: 32px;
+      line-height: 1.2;
+      margin: 8px 0 10px;
       word-wrap: break-word;
-    }
-    #stop-bro-goal-sticky .sbg-countdown {
-      font-size: 44px;
-      line-height: 1;
-      text-align: center;
-      margin: 4px 0 8px;
-      color: #1f2937;
-      font-variant-numeric: tabular-nums;
+      flex: 1;
     }
     #stop-bro-goal-sticky .sbg-done {
       background: transparent;
@@ -315,10 +318,11 @@ function injectGoalStyles() {
       cursor: pointer;
       width: 100%;
       transition: background 0.15s;
+      flex-shrink: 0;
     }
     #stop-bro-goal-sticky .sbg-done:hover { background: rgba(0, 0, 0, 0.07); }
     #stop-bro-goal-sticky.sbg-expired { background: #D1FAE5; }
-    #stop-bro-goal-sticky.sbg-expired .sbg-countdown { color: #047857; }
+    #stop-bro-goal-sticky.sbg-expired .sbg-timer { color: #047857; }
     `;
     (document.head || document.documentElement).appendChild(style);
 }
@@ -335,19 +339,15 @@ function showGoalSticky(goal, savedPosition) {
     header.className = 'sbg-header';
     const grip = document.createElement('div');
     grip.className = 'sbg-grip';
-    const title = document.createElement('div');
-    title.className = 'sbg-title';
-    title.textContent = 'Focus Goal';
+    const timer = document.createElement('div');
+    timer.className = 'sbg-timer';
+    timer.textContent = formatRemaining(goal.startedAt + goal.durationMs - Date.now());
     header.appendChild(grip);
-    header.appendChild(title);
+    header.appendChild(timer);
 
     const goalText = document.createElement('div');
     goalText.className = 'sbg-goal';
     goalText.textContent = goal.text || 'Focus session';
-
-    const countdown = document.createElement('div');
-    countdown.className = 'sbg-countdown';
-    countdown.textContent = formatRemaining(goal.startedAt + goal.durationMs - Date.now());
 
     const doneBtn = document.createElement('button');
     doneBtn.className = 'sbg-done';
@@ -359,14 +359,17 @@ function showGoalSticky(goal, savedPosition) {
 
     sticky.appendChild(header);
     sticky.appendChild(goalText);
-    sticky.appendChild(countdown);
     sticky.appendChild(doneBtn);
 
-    // Restore saved position.
-    if (savedPosition && typeof savedPosition.top === 'number' && typeof savedPosition.left === 'number') {
-        sticky.style.top = savedPosition.top + 'px';
-        sticky.style.left = savedPosition.left + 'px';
-        sticky.style.right = 'auto';
+    // Restore saved position and size.
+    if (savedPosition) {
+        if (typeof savedPosition.top === 'number' && typeof savedPosition.left === 'number') {
+            sticky.style.top = savedPosition.top + 'px';
+            sticky.style.left = savedPosition.left + 'px';
+            sticky.style.right = 'auto';
+        }
+        if (savedPosition.width) sticky.style.width = savedPosition.width + 'px';
+        if (savedPosition.height) sticky.style.height = savedPosition.height + 'px';
     }
 
     (document.body || document.documentElement).appendChild(sticky);
@@ -376,7 +379,7 @@ function showGoalSticky(goal, savedPosition) {
     if (goalTickerId) clearInterval(goalTickerId);
     const tick = () => {
         const remaining = goal.startedAt + goal.durationMs - Date.now();
-        countdown.textContent = formatRemaining(remaining);
+        timer.textContent = formatRemaining(remaining);
         if (remaining <= 0) {
             clearInterval(goalTickerId);
             goalTickerId = null;
@@ -384,6 +387,24 @@ function showGoalSticky(goal, savedPosition) {
     };
     tick();
     goalTickerId = setInterval(tick, 500);
+
+    // Persist resize via ResizeObserver.
+    let resizeTimer = null;
+    const ro = new ResizeObserver(() => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+            const rect = sticky.getBoundingClientRect();
+            chrome.storage.local.set({
+                goalPosition: {
+                    top: Math.round(rect.top),
+                    left: Math.round(rect.left),
+                    width: sticky.offsetWidth,
+                    height: sticky.offsetHeight
+                }
+            });
+        }, 300);
+    });
+    ro.observe(sticky);
 
     // Dragging.
     let dragState = null;
@@ -410,7 +431,14 @@ function showGoalSticky(goal, savedPosition) {
         sticky.classList.remove('dragging');
         try { header.releasePointerCapture(dragState.pointerId); } catch (_) {}
         const rect = sticky.getBoundingClientRect();
-        chrome.storage.local.set({ goalPosition: { top: Math.round(rect.top), left: Math.round(rect.left) } });
+        chrome.storage.local.set({
+            goalPosition: {
+                top: Math.round(rect.top),
+                left: Math.round(rect.left),
+                width: sticky.offsetWidth,
+                height: sticky.offsetHeight
+            }
+        });
         dragState = null;
     };
     header.addEventListener('pointerup', endDrag);
@@ -435,10 +463,8 @@ function showGoalExpired(goal) {
     }
     if (!goalStickyEl) return;
     goalStickyEl.classList.add('sbg-expired');
-    const countdown = goalStickyEl.querySelector('.sbg-countdown');
-    if (countdown) countdown.textContent = 'Time\u2019s up!';
-    const title = goalStickyEl.querySelector('.sbg-title');
-    if (title) title.textContent = 'Focus Complete';
+    const timerEl = goalStickyEl.querySelector('.sbg-timer');
+    if (timerEl) timerEl.textContent = "Time\u2019s up!";
     const doneBtn = goalStickyEl.querySelector('.sbg-done');
     if (doneBtn) {
         doneBtn.textContent = 'Dismiss';
