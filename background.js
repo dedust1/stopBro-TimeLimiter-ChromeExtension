@@ -1,152 +1,326 @@
-// Default settings
-let settings = {
-    defaultTimeLimit: 10,
-    sites: [
-        {url: "facebook.com", timeLimit: 15, extraTime:0}
-    ]
+// StopBro background service worker
+// - Daily-limit tracker (existing behaviour, hardened)
+// - Countdown feature: per-hostname session timer that blocks on expiry
+// - Goal feature: focus session with sticky-note overlay on active tabs
+
+const DEFAULT_SETTINGS = {
+    defaultTimeLimit: 15, // minutes
+    sites: []
 };
 
 let activeTabId = null;
-let activeUrl = null;
-let startTime = null;
+let activeHost = null;
 let intervalId = null;
 
-chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
-    if (message.action === "settingsUpdated") {
-        settings = message.settings;
+// ---- helpers ----------------------------------------------------------
 
-        // Check the currently active tab
-        chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
-            if (tabs.length > 0) {
-                let activeTab = tabs[0];
-                let activeUrl = activeTab.url;
+function hostnameOf(url) {
+    try {
+        const u = new URL(url);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+        return u.hostname.toLowerCase().replace(/^www\./, '');
+    } catch (e) {
+        return null;
+    }
+}
 
-                // If the active tab matches the newly added site, start tracking
-                chrome.storage.local.get(['settings'], function(result) {
-                    if (result.settings.sites) {
-                        let site = result.settings.sites.find( s => activeUrl.includes(s.url));
-                        if (site) {
-                            startTracking(activeTab.id, activeUrl);
-                        }
-                    }
-                })
+function hostMatches(siteHost, currentHost) {
+    if (!siteHost || !currentHost) return false;
+    return currentHost === siteHost || currentHost.endsWith('.' + siteHost);
+}
+
+function getSettings() {
+    return new Promise(resolve => {
+        chrome.storage.local.get(['settings'], result => {
+            resolve(result.settings || DEFAULT_SETTINGS);
+        });
+    });
+}
+
+function saveSettings(settings) {
+    return new Promise(resolve => {
+        chrome.storage.local.set({ settings }, resolve);
+    });
+}
+
+// Send a message to every tab whose hostname matches, swallowing errors for
+// tabs without a content script.
+function broadcastToMatchingTabs(siteHost, message) {
+    chrome.tabs.query({}, tabs => {
+        (tabs || []).forEach(tab => {
+            if (!tab.url || tab.id == null) return;
+            const host = hostnameOf(tab.url);
+            if (hostMatches(siteHost, host)) {
+                chrome.tabs.sendMessage(tab.id, message, () => void chrome.runtime.lastError);
             }
         });
-
-        sendResponse({ success: true });
-    }
-
-    if (message.action === "closeTab") {
-        chrome.tabs.remove(sender.tab.id);  // Closes the current tab
-    }
-
-});
-
-function startTracking(tabId, url) {
-    if (intervalId) clearInterval(intervalId); // Stop any existing tracking
-
-    chrome.storage.local.get(['settings'], function(result) {
-        if (result.settings && result.settings.sites) {
-            let site = result.settings.sites.find( s => url.includes(s.url));
-            if (site) {
-                activeTabId = tabId;
-                activeUrl = site.url;
-                startTime = Date.now()
-                let trackingExtraTime = false; // Flag to track extra time
-
-                intervalId = setInterval(() => {
-                    let elapsedTime = Math.floor((Date.now() - startTime) / 1000); // Seconds
-                    startTime = Date.now(); // Reset start time
-
-                    if (site.timeSpent >= site.timeLimit) {
-                        if (!trackingExtraTime) {
-                            console.log("⏳ Time limit reached! Tracking extra time...");
-                            trackingExtraTime = true;
-                            
-                            // Check if content script is ready before sending message
-                            chrome.scripting.executeScript({target: { tabId: activeTabId }, 
-                                function: () => true}, () => {
-                                if (chrome.runtime.lastError) {
-                                    console.log("Content script is not ready:", chrome.runtime.lastError.message);
-                                } else {
-                                    console.log("Sending blocking message to", activeTabId);
-                                    chrome.tabs.sendMessage(activeTabId, { action: "showBlockingScreen" });
-                                }
-                            });
-                        }
-                        site.extraTime = (site.extraTime || 0) + elapsedTime;
-
-                    } else {
-                        site.timeSpent += elapsedTime;
-                    }
-                    chrome.storage.local.set({ settings:result.settings })
-                }, 1000); //Update time every second
-            }    
-        }
     });
-};
-
-function resetTimeSpent() {
-    chrome.storage.local.get(['settings'], function(result) {
-       let settings = result.settings;
-       if (settings.sites){
-        settings.sites.forEach(site => { site.timeSpent = 0; site.extraTime = 0});
-
-        //update settings in storage
-        chrome.storage.local.set({ settings }, function() {
-        })
-       }
-    });
-
-    // Save today's date as last reset date
-    let today = new Date().toDateString();
-    chrome.storage.local.set({ lastResetDate: today }, function() {
-        console.log("Date reset to today: ", today)
-    }) 
 }
 
-//Function to check if reset is needed
-function checkReset() {
-    chrome.storage.local.get(['lastResetDate'], function(result) {
-        let lastResetDate = result.lastResetDate;
-        if (lastResetDate) {
-            let today = new Date().toDateString();
-
-        // If last reset was NOT today, reset timeSpent
-        if (lastResetDate !== today) {
-            console.log("New day detected! Resetting time tracking.");
-            resetTimeSpent();
-        }
-        }
-    })
+function broadcastToAllTabs(message) {
+    chrome.tabs.query({}, tabs => {
+        (tabs || []).forEach(tab => {
+            if (tab.id == null) return;
+            chrome.tabs.sendMessage(tab.id, message, () => void chrome.runtime.lastError);
+        });
+    });
 }
 
-// Run check on extension startup
-checkReset();
+// ---- daily-limit tracker (hardened) -----------------------------------
 
-// Detect when a new tab becomes active
-chrome.tabs.onActivated.addListener(function(activeInfo) {
-    //Get the URL of the active tab
-    chrome.tabs.get(activeInfo.tabId, function(tab) {
-        if (tab.url) startTracking(tab.id, tab.url);
+function stopTracking() {
+    if (intervalId) clearInterval(intervalId);
+    intervalId = null;
+    activeTabId = null;
+    activeHost = null;
+}
 
+async function startTracking(tabId, url) {
+    const host = hostnameOf(url);
+    if (!host) { stopTracking(); return; }
+
+    const settings = await getSettings();
+    const site = (settings.sites || []).find(s => hostMatches(s.url, host));
+    if (!site) { stopTracking(); return; }
+
+    if (intervalId) clearInterval(intervalId);
+    activeTabId = tabId;
+    activeHost = host;
+    let lastTick = Date.now();
+    let blockedNotified = false;
+
+    // If this tab should already be blocked (daily or countdown), tell it now.
+    if ((site.timeSpent || 0) >= site.timeLimit || (site.countdown && site.countdown.expired)) {
+        chrome.tabs.sendMessage(tabId, { action: 'showBlockingScreen' }, () => void chrome.runtime.lastError);
+        blockedNotified = true;
+    }
+
+    intervalId = setInterval(async () => {
+        const now = Date.now();
+        const elapsedSec = Math.floor((now - lastTick) / 1000);
+        if (elapsedSec <= 0) return;
+        lastTick = now;
+
+        // Re-read from storage each tick to avoid clobbering popup writes.
+        const current = await getSettings();
+        const currentSite = (current.sites || []).find(s => hostMatches(s.url, host));
+        if (!currentSite) return;
+
+        currentSite.timeSpent = (currentSite.timeSpent || 0);
+        currentSite.extraTime = (currentSite.extraTime || 0);
+
+        const limitReached = currentSite.timeSpent >= currentSite.timeLimit;
+        if (limitReached) {
+            currentSite.extraTime += elapsedSec;
+            if (!blockedNotified) {
+                blockedNotified = true;
+                chrome.tabs.sendMessage(tabId, { action: 'showBlockingScreen' }, () => void chrome.runtime.lastError);
+            }
+        } else {
+            currentSite.timeSpent += elapsedSec;
+            if (currentSite.timeSpent >= currentSite.timeLimit && !blockedNotified) {
+                blockedNotified = true;
+                chrome.tabs.sendMessage(tabId, { action: 'showBlockingScreen' }, () => void chrome.runtime.lastError);
+            }
+        }
+        await saveSettings(current);
+    }, 1000);
+}
+
+// ---- daily reset ------------------------------------------------------
+
+async function resetTimeSpent() {
+    const settings = await getSettings();
+    (settings.sites || []).forEach(site => {
+        site.timeSpent = 0;
+        site.extraTime = 0;
     });
+    await saveSettings(settings);
+    await new Promise(r => chrome.storage.local.set({ lastResetDate: new Date().toDateString() }, r));
+    console.log('[StopBro] Daily counters reset.');
+}
 
-});
+async function checkReset() {
+    const { lastResetDate } = await new Promise(r => chrome.storage.local.get(['lastResetDate'], r));
+    const today = new Date().toDateString();
+    if (lastResetDate && lastResetDate !== today) {
+        await resetTimeSpent();
+    } else if (!lastResetDate) {
+        chrome.storage.local.set({ lastResetDate: today });
+    }
+}
 
-// Detect when the current tab URL changes
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    if (changeInfo.url) {
-        startTracking(tabId, changeInfo.url);
+// ---- countdown feature ------------------------------------------------
+
+async function startCountdown(hostname, durationMs) {
+    const host = (hostname || '').toLowerCase().replace(/^www\./, '');
+    if (!host || !durationMs || durationMs < 1000) return;
+
+    const settings = await getSettings();
+    settings.sites = settings.sites || [];
+    let site = settings.sites.find(s => s.url === host);
+    if (!site) {
+        // Create a transient entry for the countdown; use the default daily
+        // limit as a ceiling so the site still tracks normally.
+        site = {
+            url: host,
+            timeLimit: (settings.defaultTimeLimit || 15) * 60,
+            timeSpent: 0,
+            extraTime: 0
+        };
+        settings.sites.push(site);
+    }
+    site.countdown = {
+        startedAt: Date.now(),
+        durationMs: durationMs,
+        expired: false
     };
-});
+    await saveSettings(settings);
 
-// Detect when a tab is closed to stop tracking
-chrome.tabs.onRemoved.addListener(tabId => {
-    if (tabId === activeTabId) {
-        clearInterval(intervalId);
-        activeTabId = null;
-        activeUrl = null;
-        startTime = null;
+    const alarmName = `countdown:${host}`;
+    await new Promise(r => chrome.alarms.clear(alarmName, () => r()));
+    chrome.alarms.create(alarmName, { when: Date.now() + durationMs });
+}
+
+async function cancelCountdown(hostname) {
+    const host = (hostname || '').toLowerCase().replace(/^www\./, '');
+    if (!host) return;
+    const settings = await getSettings();
+    const site = (settings.sites || []).find(s => s.url === host);
+    if (site && site.countdown) {
+        delete site.countdown;
+        await saveSettings(settings);
+    }
+    chrome.alarms.clear(`countdown:${host}`);
+}
+
+async function expireCountdown(hostname) {
+    const settings = await getSettings();
+    const site = (settings.sites || []).find(s => s.url === hostname);
+    if (!site) return;
+    site.countdown = site.countdown || {};
+    site.countdown.expired = true;
+    await saveSettings(settings);
+    broadcastToMatchingTabs(hostname, { action: 'showBlockingScreen' });
+}
+
+// ---- goal feature -----------------------------------------------------
+
+async function startGoal(text, durationMs) {
+    if (!text || !durationMs || durationMs < 1000) return;
+    const goal = {
+        text: String(text).slice(0, 200),
+        startedAt: Date.now(),
+        durationMs: durationMs,
+        active: true
+    };
+    await new Promise(r => chrome.storage.local.set({ goal }, r));
+    await new Promise(r => chrome.alarms.clear('goal:end', () => r()));
+    chrome.alarms.create('goal:end', { when: Date.now() + durationMs });
+    broadcastToAllTabs({ action: 'showGoalSticky', goal });
+}
+
+async function endGoal() {
+    const { goal } = await new Promise(r => chrome.storage.local.get(['goal'], r));
+    if (goal) {
+        goal.active = false;
+        await new Promise(r => chrome.storage.local.set({ goal }, r));
+    }
+    chrome.alarms.clear('goal:end');
+    broadcastToAllTabs({ action: 'hideGoalSticky' });
+}
+
+async function expireGoal() {
+    const { goal } = await new Promise(r => chrome.storage.local.get(['goal'], r));
+    if (!goal) return;
+    goal.active = false;
+    goal.expired = true;
+    await new Promise(r => chrome.storage.local.set({ goal }, r));
+    broadcastToAllTabs({ action: 'goalExpired', goal });
+}
+
+// ---- message + alarm routing ------------------------------------------
+
+chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
+    if (!message || !message.action) return;
+
+    switch (message.action) {
+        case 'settingsUpdated':
+            // The settings are already in storage; just re-evaluate the
+            // active tab so any newly-added site starts tracking.
+            chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+                if (tabs && tabs[0] && tabs[0].url) {
+                    startTracking(tabs[0].id, tabs[0].url);
+                }
+            });
+            sendResponse({ success: true });
+            return true;
+
+        case 'closeTab':
+            if (sender.tab && sender.tab.id != null) chrome.tabs.remove(sender.tab.id);
+            return;
+
+        case 'startCountdown':
+            startCountdown(message.hostname, message.durationMs).then(() => sendResponse({ success: true }));
+            return true;
+
+        case 'cancelCountdown':
+            cancelCountdown(message.hostname).then(() => sendResponse({ success: true }));
+            return true;
+
+        case 'startGoal':
+            startGoal(message.text, message.durationMs).then(() => sendResponse({ success: true }));
+            return true;
+
+        case 'endGoal':
+            endGoal().then(() => sendResponse({ success: true }));
+            return true;
     }
 });
+
+chrome.alarms.onAlarm.addListener(alarm => {
+    if (!alarm || !alarm.name) return;
+    if (alarm.name === 'dailyReset') {
+        checkReset();
+        return;
+    }
+    if (alarm.name === 'goal:end') {
+        expireGoal();
+        return;
+    }
+    if (alarm.name.startsWith('countdown:')) {
+        expireCountdown(alarm.name.slice('countdown:'.length));
+    }
+});
+
+chrome.tabs.onActivated.addListener(function (activeInfo) {
+    chrome.tabs.get(activeInfo.tabId, function (tab) {
+        if (chrome.runtime.lastError || !tab) return;
+        if (tab.url) startTracking(tab.id, tab.url);
+    });
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.url && tab.active) {
+        startTracking(tabId, changeInfo.url);
+    }
+});
+
+chrome.tabs.onRemoved.addListener(tabId => {
+    if (tabId === activeTabId) stopTracking();
+});
+
+// Boot-time initialisation.
+chrome.runtime.onStartup.addListener(() => {
+    checkReset();
+    chrome.alarms.create('dailyReset', { periodInMinutes: 60 });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+    checkReset();
+    chrome.alarms.create('dailyReset', { periodInMinutes: 60 });
+});
+
+// Run on service-worker wake too, in case neither of the above fire.
+checkReset();
+chrome.alarms.create('dailyReset', { periodInMinutes: 60 });
